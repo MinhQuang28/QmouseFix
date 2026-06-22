@@ -20,6 +20,7 @@ final class EventTapEngine {
     private var scrollMode: ScrollMode = .smooth
     private var scrollSpeed = 0.5
     private var scrollLines = 3
+    private var smoothHighRes = false
     private var spaceDragButton = 0
     private var spaceDragThreshold = 200.0
     private var spaceDragReverse = false
@@ -94,6 +95,7 @@ final class EventTapEngine {
         scrollMode = config.scrollMode
         scrollSpeed = config.scrollSpeed
         scrollLines = config.scrollLines
+        smoothHighRes = config.smoothHighRes
         spaceDragButton = config.spaceDragButton
         spaceDragThreshold = config.spaceDragThreshold
         spaceDragReverse = config.spaceDragReverse
@@ -152,6 +154,7 @@ final class EventTapEngine {
         let mode = scrollMode
         let speed = scrollSpeed
         let lines = scrollLines
+        let smoothHiRes = smoothHighRes
         spaceDrag.button = spaceDragButton
         spaceDrag.threshold = spaceDragThreshold
         spaceDrag.reverse = spaceDragReverse
@@ -215,6 +218,20 @@ final class EventTapEngine {
             // floaty. Instead keep them native but honor the user's Scroll-speed slider and reverse —
             // both of which otherwise never reach a continuous mouse.
             if isContinuous {
+                // High-res mice with NO flywheel (e.g. Keychron M6) report continuous pixels but scroll
+                // choppily because the OS adds no momentum. When the user opts in, route their pixel
+                // deltas through the same ease-to-target animator that smooths the notch path. Free-spin
+                // mice (MX Master 3) should leave this OFF so we don't fight their hardware flywheel.
+                let animated = (mode == .smooth || mode == .smoothStep)
+                if smoothHiRes, animated {
+                    let dir = reverse ? -1.0 : 1.0
+                    let pxV = event.getDoubleValueField(.scrollWheelEventFixedPtDeltaAxis1) * dir
+                    let pxH = event.getDoubleValueField(.scrollWheelEventFixedPtDeltaAxis2) * dir
+                    if pxV != 0 || pxH != 0 {
+                        scrollAnimator.addPixels(pxV: pxV, pxH: pxH, speed: speed)
+                        return nil // swallow; the animator drives the pixel scroll
+                    }
+                }
                 applyContinuous(event, speed: speed, reverse: reverse)
                 return Unmanaged.passUnretained(event)
             }

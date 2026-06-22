@@ -87,7 +87,40 @@ final class ScrollAnimator: NSObject {
         if wasIdle { startOrWake() }
     }
 
+    /// Feed raw pixel deltas from a high-res "continuous" mouse (e.g. Keychron M6) that reports pixel
+    /// motion but has no hardware flywheel, so macOS renders it choppily. Accumulating the pixels into
+    /// the same ease-to-target glide smooths the bursts the way the notch path smooths wheel clicks —
+    /// total distance is preserved (scaled by `speed`), just spread over the ease window.
+    func addPixels(pxV: Double, pxH: Double, speed: Double) {
+        let now = CACurrentMediaTime()
+        let gain = speed / 0.5 // 0.5 slider default → 1.0 (native magnitude)
+
+        lock.lock()
+        response = responseSmooth
+        if pxV != 0, (pxV > 0) != (remV > 0) { remV = 0; carryV = 0 }
+        if pxH != 0, (pxH > 0) != (remH > 0) { remH = 0; carryH = 0 }
+        remV = clampDist(remV + pxV * gain)
+        remH = clampDist(remH + pxH * gain)
+        lastMotionTime = now
+        let wasIdle = !running
+        if wasIdle { running = true; lastTime = now; phaseStarted = false }
+        lock.unlock()
+
+        if wasIdle { startOrWake() }
+    }
+
     private func clampDist(_ v: Double) -> Double { max(-maxRemaining, min(maxRemaining, v)) }
+
+    /// Pure, frame-rate-independent ease step (extracted so it's unit-testable). Emits a fraction
+    /// `1 - e^(-dt/response)` of what's left, but flushes the final sub-`stopDistance` sliver in one go
+    /// so motion actually reaches the target instead of crawling asymptotically. Returns the delta to
+    /// emit this frame and the remaining distance after it.
+    static func advance(remaining: Double, dt: Double, response: Double,
+                        stopDistance: Double) -> (delta: Double, remaining: Double) {
+        if abs(remaining) < stopDistance { return (remaining, 0) }
+        let delta = remaining * (1 - exp(-dt / response))
+        return (delta, remaining - delta)
+    }
 
     /// Spin up the animator thread on first use, or un-pause its display link on later glides.
     /// `thread`/`linkRunLoop` are read+written under `lock` so a failed start (see `runLoop`) can be
@@ -164,10 +197,10 @@ final class ScrollAnimator: NSObject {
         // Frame-rate-independent ease: take a fraction of what's left so the per-frame delta tapers
         // smoothly. Flush the last sub-`stopDistance` sliver in one go so motion actually reaches the
         // target and stops, instead of crawling asymptotically.
-        let frac = 1 - exp(-dt / response)
-        var dV = 0.0, dH = 0.0
-        if abs(remV) < stopDistance { dV = remV; remV = 0 } else { dV = remV * frac; remV -= dV }
-        if abs(remH) < stopDistance { dH = remH; remH = 0 } else { dH = remH * frac; remH -= dH }
+        let (dV, newRemV) = ScrollAnimator.advance(remaining: remV, dt: dt, response: response, stopDistance: stopDistance)
+        let (dH, newRemH) = ScrollAnimator.advance(remaining: remH, dt: dt, response: response, stopDistance: stopDistance)
+        remV = newRemV
+        remH = newRemH
 
         let moving = dV != 0 || dH != 0
         var iV = 0.0, iH = 0.0

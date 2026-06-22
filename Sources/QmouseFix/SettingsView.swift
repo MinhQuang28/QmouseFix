@@ -59,6 +59,11 @@ struct SettingsView: View {
                 }
             }
             Toggle("Reverse scroll direction", isOn: $store.config.reverseScroll)
+            if store.config.scrollMode != .standard {
+                Toggle("Smooth high-res mice", isOn: $store.config.smoothHighRes)
+                Text("Turn on for high-resolution mice that scroll choppily (e.g. Keychron M6) so they use the same smoothing as a notched wheel. Leave OFF for free-spin mice like the MX Master 3 — their hardware flywheel is already smooth and this would fight it.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
             Text("Standard = instant wheel (no animation). Smooth = trackpad-style momentum. Smooth-step = Windows-browser feel: each notch eases a fixed number of lines with no coast. Applies to a physical mouse wheel only — trackpad scrolling is left untouched.")
                 .font(.caption).foregroundStyle(.secondary)
         }
