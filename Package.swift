@@ -13,6 +13,12 @@ let package = Package(
                 // without Swift 6 strict-concurrency ceremony. Tighten to .v6 once the engine is stable.
                 .swiftLanguageMode(.v5)
             ]
+        ),
+        .testTarget(
+            name: "QmouseFixTests",
+            dependencies: ["QmouseFix"],
+            path: "Tests/QmouseFixTests",
+            swiftSettings: [.swiftLanguageMode(.v5)]
         )
     ]
 )
