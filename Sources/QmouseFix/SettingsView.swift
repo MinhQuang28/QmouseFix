@@ -53,8 +53,13 @@ struct SettingsView: View {
                       maximumValueLabel: { Text("Fast").font(.caption) }
                 }
             }
+            if store.config.scrollMode == .smoothStep {
+                Stepper(value: $store.config.scrollLines, in: 1...10) {
+                    Text("Lines per notch: \(store.config.scrollLines)")
+                }
+            }
             Toggle("Reverse scroll direction", isOn: $store.config.reverseScroll)
-            Text("Standard = stepped wheel (Windows-like). Smooth = trackpad-style momentum. Applies to a physical mouse wheel only — trackpad scrolling is left untouched.")
+            Text("Standard = instant wheel (no animation). Smooth = trackpad-style momentum. Smooth-step = Windows-browser feel: each notch eases a fixed number of lines with no coast. Applies to a physical mouse wheel only — trackpad scrolling is left untouched.")
                 .font(.caption).foregroundStyle(.secondary)
         }
         .formStyle(.grouped)

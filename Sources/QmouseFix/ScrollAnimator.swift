@@ -27,17 +27,17 @@ final class ScrollAnimator: NSObject {
     static let syntheticTag: Int64 = 0x5132_4D46 // "Q2MF"
 
     private let lock = NSLock()
-    private var velV = 0.0    // velocity, pixels per second
-    private var velH = 0.0
-    private var carryV = 0.0  // sub-pixel carry for the integer pixel field
+    private var remV = 0.0     // pixels still to emit, vertical (the running scroll target)
+    private var remH = 0.0     // pixels still to emit, horizontal
+    private var carryV = 0.0   // sub-pixel carry for the integer pixel field
     private var carryH = 0.0
     private var running = false
     private var lastTime = 0.0
     private var lastMotionTime = 0.0   // last frame/tick that actually moved — drives the gesture hold
     private var phaseStarted = false   // whether the current glide has emitted its "began" event yet
-    private let gestureHold = 0.18     // s to keep the gesture (and link) alive after velocity dies, so
-                                       // consecutive ticks continue ONE gesture instead of thrashing
-                                       // ended→began each notch (the cause of the hitchy feel)
+    private let gestureHold = 0.12     // s to keep the gesture (and link) alive after motion settles, so
+                                       // consecutive notches continue ONE gesture instead of thrashing
+                                       // ended→began each notch (a cause of the hitchy feel)
     private let source = CGEventSource(stateID: .hidSystemState)
 
     // Undocumented gesture-phase field + values. Tagging our synthetic events as a coherent gesture
@@ -52,51 +52,33 @@ final class ScrollAnimator: NSObject {
     private var linkRunLoop: CFRunLoop?        // that thread's run loop, for cross-thread wake-ups
     private var thread: Thread?
 
-    // Momentum tuning. ("Light / near-1:1" profile: acceleration off, very short coast — each notch
-    // moves a predictable amount and the glide settles almost as soon as you stop. `baseImpulse` is
-    // the headline sensitivity knob; the user's Settings "Scroll speed" scales it on top via `speed`.)
-    private let baseImpulse = 420.0  // px/sec added per notch at speed 1.0, before acceleration
-    private let decayPerSec = 0.006  // velocity multiplier per second → short coast (~0.2 s)
-    private let maxVel = 9000.0      // px/sec clamp so fast spins don't fling absurdly far
-    private let stopVel = 40.0       // px/sec; below this the glide ends (higher = stops sooner)
+    // Scroll tuning — a distance-accumulator (ease-to-target) model, not impulse+decay. Each notch
+    // ADDS a fixed distance to the remaining target; every frame emits a fraction of what's left, so
+    // the per-frame delta tapers smoothly (no per-notch pulsing) and motion stops exactly at the
+    // accumulated distance (no floaty over-coast). This is what fixes the "khựng/giật + trễ" feel,
+    // especially in Chromium/Electron apps (VS Code) whose own velocity tracker hated the old
+    // spike-then-decay deltas.
+    private let pixelsPerNotch = 70.0 // Smooth: distance one notch contributes at speed 1.0 (× `speed`)
+    private let pixelsPerLine = 30.0  // Smooth-step: pixels per "line" of the fixed N-line notch step
+    private var response = 0.07       // s — current ease time constant (set per tick by the mode)
+    private let responseSmooth = 0.07 // floatier, trackpad-like momentum
+    private let responseStep = 0.045  // crisp: settles in ~0.15 s so each notch lands as a discrete step
+    private let maxRemaining = 6000.0 // px clamp so a fast spin can't accumulate an absurd target
+    private let stopDistance = 0.1    // px; below this the remaining is flushed and the glide settles
 
-    // Acceleration tuning. (Disabled for this profile: accelMax 1.0 and speedupBase 1.0 mean every
-    // notch contributes the same impulse, so distance scrolled is fully predictable.)
-    private let tickIntervalMin = 0.015 // s — fastest natural tick gap; anything faster reads as max speed
-    private let tickIntervalMax = 0.16  // s — gap beyond which ticks aren't "consecutive" (resets accel)
-    private let accelMax = 1.0          // impulse multiplier at the fastest tick speed (1.0 = off)
-    private let speedupAfter = 6        // consecutive ticks before the exponential speedup kicks in
-    private let speedupBase = 1.0       // per-tick growth once past `speedupAfter` (1.0 = off)
-    private let speedupMax = 1.0        // cap so it can't run away
-    private var lastTickTime = 0.0
-    private var consecutiveTicks = 0
-
-    /// Feed a wheel tick (line deltas, already direction-corrected). `speed` scales momentum.
-    func addTick(lineV: Double, lineH: Double, speed: Double) {
+    /// Feed a wheel notch (line deltas, already direction-corrected). In Smooth-step mode each notch is
+    /// a fixed `lines`-line step with a crisp ease and no coast; otherwise `speed` scales a momentum glide.
+    func addTick(lineV: Double, lineH: Double, speed: Double, stepped: Bool, lines: Int) {
         let now = CACurrentMediaTime()
-        let interval = now - lastTickTime
-        lastTickTime = now
-
-        // Reset the consecutive run when too long a gap passes; otherwise grow it.
-        if interval > tickIntervalMax { consecutiveTicks = 0 } else { consecutiveTicks += 1 }
-
-        // Tick-speed acceleration: map the gap (clamped) to 0 (slow) … 1 (fast), then to a multiplier.
-        let clamped = min(max(interval, tickIntervalMin), tickIntervalMax)
-        let fastness = (tickIntervalMax - clamped) / (tickIntervalMax - tickIntervalMin)
-        let accel = 1.0 + fastness * (accelMax - 1.0)
-
-        // Consecutive-tick speedup: exponential growth once a sustained scroll is underway.
-        let extra = consecutiveTicks - speedupAfter
-        let speedup = extra > 0 ? min(pow(speedupBase, Double(extra)), speedupMax) : 1.0
-
-        let impulse = baseImpulse * speed * accel * speedup
+        let dist = stepped ? Double(lines) * pixelsPerLine : pixelsPerNotch * speed
 
         lock.lock()
-        // Reversing direction: drop the opposing velocity so the flip is immediate, not muddy.
-        if lineV != 0, (lineV > 0) != (velV > 0) { velV = 0; carryV = 0 }
-        if lineH != 0, (lineH > 0) != (velH > 0) { velH = 0; carryH = 0 }
-        velV = clamp(velV + lineV * impulse)
-        velH = clamp(velH + lineH * impulse)
+        response = stepped ? responseStep : responseSmooth
+        // Reversing direction: drop the opposing remainder so the flip is immediate, not muddy.
+        if lineV != 0, (lineV > 0) != (remV > 0) { remV = 0; carryV = 0 }
+        if lineH != 0, (lineH > 0) != (remH > 0) { remH = 0; carryH = 0 }
+        remV = clampDist(remV + lineV * dist)
+        remH = clampDist(remH + lineH * dist)
         lastMotionTime = now
         let wasIdle = !running
         if wasIdle { running = true; lastTime = now; phaseStarted = false }
@@ -105,7 +87,7 @@ final class ScrollAnimator: NSObject {
         if wasIdle { startOrWake() }
     }
 
-    private func clamp(_ v: Double) -> Double { max(-maxVel, min(maxVel, v)) }
+    private func clampDist(_ v: Double) -> Double { max(-maxRemaining, min(maxRemaining, v)) }
 
     /// Spin up the animator thread on first use, or un-pause its display link on later glides.
     /// `thread`/`linkRunLoop` are read+written under `lock` so a failed start (see `runLoop`) can be
@@ -143,7 +125,7 @@ final class ScrollAnimator: NSObject {
         linkRunLoop = nil
         thread = nil
         running = false
-        velV = 0; velH = 0; carryV = 0; carryH = 0
+        remV = 0; remH = 0; carryV = 0; carryH = 0
         phaseStarted = false
         lock.unlock()
 
@@ -161,7 +143,7 @@ final class ScrollAnimator: NSObject {
         guard let link = NSScreen.main?.displayLink(target: self, selector: #selector(step(_:))) else {
             // No display right now (asleep / clamshell / switching). Reset so the NEXT tick retries
             // instead of leaving smooth scroll permanently dead.
-            lock.lock(); thread = nil; running = false; velV = 0; velH = 0; lock.unlock()
+            lock.lock(); thread = nil; running = false; remV = 0; remH = 0; lock.unlock()
             return
         }
         lock.lock(); linkRunLoop = CFRunLoopGetCurrent(); displayLink = link; lock.unlock()
@@ -171,27 +153,30 @@ final class ScrollAnimator: NSObject {
         CFRunLoopRun()
     }
 
-    /// One display-refresh tick: decay velocity, emit the elapsed distance, pause the link when idle.
+    /// One display-refresh tick: emit a fraction of the remaining distance (smooth ease-out toward the
+    /// accumulated target), then pause the link when settled.
     @objc private func step(_ link: CADisplayLink) {
         lock.lock()
         let now = CACurrentMediaTime()
         let dt = min(now - lastTime, 0.05) // clamp after any stall so we don't lurch
         lastTime = now
-        let decay = pow(decayPerSec, dt)   // frame-rate-independent exponential friction
-        velV *= decay
-        velH *= decay
 
-        let moving = abs(velV) >= stopVel || abs(velH) >= stopVel
+        // Frame-rate-independent ease: take a fraction of what's left so the per-frame delta tapers
+        // smoothly. Flush the last sub-`stopDistance` sliver in one go so motion actually reaches the
+        // target and stops, instead of crawling asymptotically.
+        let frac = 1 - exp(-dt / response)
         var dV = 0.0, dH = 0.0
+        if abs(remV) < stopDistance { dV = remV; remV = 0 } else { dV = remV * frac; remV -= dV }
+        if abs(remH) < stopDistance { dH = remH; remH = 0 } else { dH = remH * frac; remH -= dH }
+
+        let moving = dV != 0 || dH != 0
         var iV = 0.0, iH = 0.0
         if moving {
             lastMotionTime = now
-            dV = velV * dt
-            dH = velH * dt
             carryV += dV; iV = carryV.rounded(.towardZero); carryV -= iV
             carryH += dH; iH = carryH.rounded(.towardZero); carryH -= iH
         } else {
-            velV = 0; velH = 0; carryV = 0; carryH = 0 // settle, but keep the gesture/link warm
+            carryV = 0; carryH = 0 // settle, but keep the gesture/link warm
         }
 
         // Only truly finish once the gesture has been idle past the hold window — until then a new tick

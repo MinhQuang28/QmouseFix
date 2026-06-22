@@ -2,13 +2,15 @@ import Foundation
 
 /// How the mouse wheel scrolls.
 enum ScrollMode: String, Codable, Sendable, CaseIterable {
-    case standard  // OS stepped wheel — like Windows; each notch jumps
-    case smooth    // trackpad-style eased momentum
+    case standard    // OS stepped wheel — raw passthrough; each notch jumps instantly
+    case smooth      // trackpad-style eased momentum
+    case smoothStep  // Windows-browser style: each notch eases a fixed N-line step, no coast
 
     var label: String {
         switch self {
-        case .standard: return "Standard (stepped)"
-        case .smooth:   return "Smooth (trackpad)"
+        case .standard:   return "Standard (instant)"
+        case .smooth:     return "Smooth (trackpad)"
+        case .smoothStep: return "Smooth-step (Windows)"
         }
     }
 }
@@ -27,6 +29,7 @@ struct AppConfig: Codable, Sendable {
     var reverseScroll: Bool = false
     var scrollMode: ScrollMode = .smooth
     var scrollSpeed: Double = 0.5       // 0.2 (slow) … 1.5 (fast); scales smooth-scroll momentum
+    var scrollLines: Int = 3            // lines per notch in Smooth-step mode (Windows default = 3)
     var spaceDragButton: Int = 0        // 0 = off; else button held to drag-switch Spaces
     var spaceDragThreshold: Double = 200 // pixels of horizontal drag per Space switch
     var spaceDragReverse: Bool = false  // flip drag direction ↔ Space direction
@@ -43,7 +46,7 @@ struct AppConfig: Codable, Sendable {
 /// (which would wipe the user's saved config). Encoding stays synthesized.
 extension AppConfig {
     enum CodingKeys: String, CodingKey {
-        case enabled, reverseScroll, scrollMode, smoothScroll, scrollSpeed
+        case enabled, reverseScroll, scrollMode, smoothScroll, scrollSpeed, scrollLines
         case spaceDragButton, spaceDragThreshold, spaceDragReverse, mappings
     }
 
@@ -59,6 +62,7 @@ extension AppConfig {
             scrollMode = legacy ? .smooth : .standard
         }
         scrollSpeed        = try c.decodeIfPresent(Double.self,          forKey: .scrollSpeed)        ?? scrollSpeed
+        scrollLines        = try c.decodeIfPresent(Int.self,             forKey: .scrollLines)        ?? scrollLines
         spaceDragButton    = try c.decodeIfPresent(Int.self,             forKey: .spaceDragButton)    ?? spaceDragButton
         spaceDragThreshold = try c.decodeIfPresent(Double.self,          forKey: .spaceDragThreshold) ?? spaceDragThreshold
         spaceDragReverse   = try c.decodeIfPresent(Bool.self,            forKey: .spaceDragReverse)   ?? spaceDragReverse
@@ -72,6 +76,7 @@ extension AppConfig {
         try c.encode(reverseScroll, forKey: .reverseScroll)
         try c.encode(scrollMode, forKey: .scrollMode)
         try c.encode(scrollSpeed, forKey: .scrollSpeed)
+        try c.encode(scrollLines, forKey: .scrollLines)
         try c.encode(spaceDragButton, forKey: .spaceDragButton)
         try c.encode(spaceDragThreshold, forKey: .spaceDragThreshold)
         try c.encode(spaceDragReverse, forKey: .spaceDragReverse)

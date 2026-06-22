@@ -19,6 +19,7 @@ final class EventTapEngine {
     private var reverseScroll = false
     private var scrollMode: ScrollMode = .smooth
     private var scrollSpeed = 0.5
+    private var scrollLines = 3
     private var spaceDragButton = 0
     private var spaceDragThreshold = 200.0
     private var spaceDragReverse = false
@@ -92,6 +93,7 @@ final class EventTapEngine {
         reverseScroll = config.reverseScroll
         scrollMode = config.scrollMode
         scrollSpeed = config.scrollSpeed
+        scrollLines = config.scrollLines
         spaceDragButton = config.spaceDragButton
         spaceDragThreshold = config.spaceDragThreshold
         spaceDragReverse = config.spaceDragReverse
@@ -147,8 +149,9 @@ final class EventTapEngine {
         let capturing = captureMode
         let maps = mappingsByButton
         let reverse = reverseScroll
-        let smooth = (scrollMode == .smooth)
+        let mode = scrollMode
         let speed = scrollSpeed
+        let lines = scrollLines
         spaceDrag.button = spaceDragButton
         spaceDrag.threshold = spaceDragThreshold
         spaceDrag.reverse = spaceDragReverse
@@ -220,10 +223,13 @@ final class EventTapEngine {
             let lineV = Double(event.getIntegerValueField(.scrollWheelEventDeltaAxis1)) * dir
             let lineH = Double(event.getIntegerValueField(.scrollWheelEventDeltaAxis2)) * dir
 
-            // Notched mouse: smooth mode drives a momentum glide from the discrete line ticks.
-            if smooth, lineV != 0 || lineH != 0 {
-                scrollAnimator.addTick(lineV: lineV, lineH: lineH, speed: speed)
-                return nil // swallow; the animator drives a smooth pixel scroll
+            // Notched mouse: Smooth and Smooth-step both drive the animator (momentum vs crisp N-line
+            // step); Standard falls through to raw passthrough below.
+            let animated = (mode == .smooth || mode == .smoothStep)
+            if animated, lineV != 0 || lineH != 0 {
+                scrollAnimator.addTick(lineV: lineV, lineH: lineH, speed: speed,
+                                       stepped: mode == .smoothStep, lines: lines)
+                return nil // swallow; the animator drives the pixel scroll
             }
             if reverse {
                 // Integer line + pixel deltas...
