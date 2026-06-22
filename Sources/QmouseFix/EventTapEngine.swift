@@ -57,7 +57,19 @@ final class EventTapEngine {
         // animator's CADisplayLink the same way sleep does — rebuild it so scroll never silently dies.
         NotificationCenter.default.addObserver(self, selector: #selector(handleWake),
                              name: NSApplication.didChangeScreenParametersNotification, object: nil)
+        // A smooth gesture that spans a Space switch (or app activation) gets orphaned and ignored by
+        // the newly-focused window — close it immediately so the next scroll opens a fresh gesture.
+        wsCenter.addObserver(self, selector: #selector(handleContextChange),
+                             name: NSWorkspace.activeSpaceDidChangeNotification, object: nil)
+        wsCenter.addObserver(self, selector: #selector(handleContextChange),
+                             name: NSWorkspace.didActivateApplicationNotification, object: nil)
         startWatchdog()
+    }
+
+    /// Space/app-focus changed — end any in-flight smooth gesture so it can't get orphaned across the
+    /// boundary (harmless no-op when no gesture is active).
+    @objc func handleContextChange() {
+        scrollAnimator.endGestureNow()
     }
 
     /// On wake, re-enable the tap AND rebuild the scroll animator's display link, which macOS

@@ -111,6 +111,29 @@ final class ScrollAnimator: NSObject {
 
     private func clampDist(_ v: Double) -> Double { max(-maxRemaining, min(maxRemaining, v)) }
 
+    /// Close any in-flight glide/gesture immediately and reset, so the NEXT scroll opens a fresh
+    /// `began`. A smooth gesture that spans a Space switch gets orphaned (the new Space's window never
+    /// saw its `began`) and is ignored until a fresh one starts — forcing that fresh start here is the
+    /// fix. `running = false` is the part that matters (next tick becomes `wasIdle`); the posted `ended`
+    /// just closes the gesture cleanly in the app we were scrolling.
+    func endGestureNow() {
+        lock.lock()
+        let rl = linkRunLoop
+        let hadGesture = phaseStarted
+        running = false
+        phaseStarted = false
+        remV = 0; remH = 0; carryV = 0; carryH = 0
+        lock.unlock()
+
+        guard hadGesture, let rl else { return } // nothing open → nothing to close
+        CFRunLoopPerformBlock(rl, CFRunLoopMode.commonModes.rawValue) { [weak self] in
+            guard let self else { return }
+            self.post(intV: 0, intH: 0, preciseV: 0, preciseH: 0, phase: self.phaseEnded)
+            self.displayLink?.isPaused = true
+        }
+        CFRunLoopWakeUp(rl)
+    }
+
     /// Pure, frame-rate-independent ease step (extracted so it's unit-testable). Emits a fraction
     /// `1 - e^(-dt/response)` of what's left, but flushes the final sub-`stopDistance` sliver in one go
     /// so motion actually reaches the target instead of crawling asymptotically. Returns the delta to
