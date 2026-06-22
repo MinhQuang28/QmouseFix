@@ -1,3 +1,4 @@
+import AppKit
 import CoreGraphics
 import Foundation
 
@@ -10,14 +11,17 @@ final class EventTapEngine {
 
     private var tap: CFMachPort?
     private var thread: Thread?
+    private var watchdog: Timer?
 
     // Snapshot read by the tap callback thread; guarded by `lock`.
     private let lock = NSLock()
     private var enabled = true
     private var reverseScroll = false
-    private var smoothScroll = false
+    private var scrollMode: ScrollMode = .smooth
+    private var scrollSpeed = 0.5
     private var spaceDragButton = 0
     private var spaceDragThreshold = 200.0
+    private var spaceDragReverse = false
     private var captureMode = false
     private var mappingsByButton: [Int: RemapAction] = [:]
 
@@ -34,6 +38,41 @@ final class EventTapEngine {
         t.qualityOfService = .userInteractive
         thread = t
         t.start()
+
+        // macOS often disables the tap across sleep/wake WITHOUT delivering a
+        // tapDisabledByTimeout event to our callback — so the callback's re-enable never fires
+        // and the whole tap (scroll + Space-drag) stays dead until relaunch. Proactively re-enable
+        // on wake, and keep a light watchdog as a safety net for silent disables.
+        let wsCenter = NSWorkspace.shared.notificationCenter
+        wsCenter.addObserver(self, selector: #selector(handleWake),
+                             name: NSWorkspace.didWakeNotification, object: nil)
+        wsCenter.addObserver(self, selector: #selector(handleWake),
+                             name: NSWorkspace.screensDidWakeNotification, object: nil)
+        startWatchdog()
+    }
+
+    /// On wake, re-enable the tap AND rebuild the scroll animator's display link, which macOS
+    /// invalidates across sleep (leaving smooth scroll dead until it eventually self-heals).
+    @objc func handleWake() {
+        reEnableTap()
+        scrollAnimator.handleWake()
+    }
+
+    /// Re-enable the tap if macOS disabled it (e.g. across sleep/wake). Safe to call from any thread
+    /// and idempotent — tapEnable on an already-enabled tap is a no-op.
+    @objc func reEnableTap() {
+        guard let tap else { return }
+        if !CGEvent.tapIsEnabled(tap: tap) {
+            CGEvent.tapEnable(tap: tap, enable: true)
+            NSLog("QmouseFix: event tap was disabled (sleep/wake?), re-enabled")
+        }
+    }
+
+    /// Periodically poll for a silently-disabled tap. 2s is invisible to the user yet costs nothing.
+    private func startWatchdog() {
+        let timer = Timer(timeInterval: 2.0, repeats: true) { [weak self] _ in self?.reEnableTap() }
+        RunLoop.main.add(timer, forMode: .common)
+        watchdog = timer
     }
 
     /// While capturing in Settings, let mouse-button events pass through to the UI (so the capture
@@ -47,9 +86,11 @@ final class EventTapEngine {
         lock.lock()
         enabled = config.enabled
         reverseScroll = config.reverseScroll
-        smoothScroll = config.smoothScroll
+        scrollMode = config.scrollMode
+        scrollSpeed = config.scrollSpeed
         spaceDragButton = config.spaceDragButton
         spaceDragThreshold = config.spaceDragThreshold
+        spaceDragReverse = config.spaceDragReverse
         mappingsByButton = Dictionary(config.mappings.map { ($0.buttonNumber, $0.action) },
                                       uniquingKeysWith: { first, _ in first })
         lock.unlock()
@@ -65,15 +106,23 @@ final class EventTapEngine {
             (1 << CGEventType.scrollWheel.rawValue)
 
         let refcon = Unmanaged.passUnretained(self).toOpaque()
-        guard let tap = CGEvent.tapCreate(tap: .cghidEventTap,
-                                          place: .headInsertEventTap,
-                                          options: .defaultTap,
-                                          eventsOfInterest: mask,
-                                          callback: eventTapCallback,
-                                          userInfo: refcon) else {
-            NSLog("QmouseFix: failed to create event tap — is Accessibility granted?")
-            return
+
+        // tapCreate returns nil until Accessibility is granted. Retry instead of giving up, so the
+        // tap comes alive the moment the user flips the toggle — no app restart needed.
+        var created: CFMachPort?
+        while created == nil {
+            created = CGEvent.tapCreate(tap: .cghidEventTap,
+                                        place: .headInsertEventTap,
+                                        options: .defaultTap,
+                                        eventsOfInterest: mask,
+                                        callback: eventTapCallback,
+                                        userInfo: refcon)
+            if created == nil {
+                NSLog("QmouseFix: event tap not created (Accessibility not granted yet?), retrying…")
+                Thread.sleep(forTimeInterval: 1.0)
+            }
         }
+        let tap = created!
         self.tap = tap
         let source = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, tap, 0)
         CFRunLoopAddSource(CFRunLoopGetCurrent(), source, .commonModes)
@@ -94,9 +143,11 @@ final class EventTapEngine {
         let capturing = captureMode
         let maps = mappingsByButton
         let reverse = reverseScroll
-        let smooth = smoothScroll
+        let smooth = (scrollMode == .smooth)
+        let speed = scrollSpeed
         spaceDrag.button = spaceDragButton
         spaceDrag.threshold = spaceDragThreshold
+        spaceDrag.reverse = spaceDragReverse
         lock.unlock()
 
         // During capture, let button events reach the Settings UI untouched.
@@ -111,21 +162,30 @@ final class EventTapEngine {
         guard on else { return Unmanaged.passUnretained(event) }
 
         switch type {
-        case .otherMouseDown, .otherMouseUp:
+        case .otherMouseDown:
             let button = Int(event.getIntegerValueField(.mouseEventButtonNumber)) + 1
-            // The Space-drag gesture claims its button before any remap.
-            if type == .otherMouseDown, spaceDrag.handleButtonDown(button) { return nil }
-            if type == .otherMouseUp,   spaceDrag.handleButtonUp(button)   { return nil }
-            if let action = maps[button] {
-                if type == .otherMouseDown { action.post() }
-                return nil // swallow the original button event
+            // The Space-drag gesture owns its button: swallow the down and decide click-vs-drag
+            // on release (so a plain click can still fire the button's mapped action).
+            if spaceDrag.handleButtonDown(button) { return nil }
+            if let action = maps[button] { action.post(); return nil }
+            return Unmanaged.passUnretained(event)
+
+        case .otherMouseUp:
+            let button = Int(event.getIntegerValueField(.mouseEventButtonNumber)) + 1
+            let up = spaceDrag.handleButtonUp(button)
+            if up.consumed {
+                // A plain click (no drag) on the gesture button still triggers its remap.
+                if up.wasClick, let action = maps[button] { action.post() }
+                return nil
             }
+            if maps[button] != nil { return nil } // we swallowed the down; swallow the up too
             return Unmanaged.passUnretained(event)
 
         case .otherMouseDragged:
-            // While the gesture is active, feed it the horizontal delta and swallow the drag
-            // (this also freezes the cursor during the swipe).
-            if spaceDrag.handleDrag(deltaX: event.getDoubleValueField(.mouseEventDeltaX)) { return nil }
+            // While the gesture is active, feed it both axes and swallow the drag so the motion
+            // drives Spaces/Mission Control instead of moving anything underneath.
+            if spaceDrag.handleDrag(deltaX: event.getDoubleValueField(.mouseEventDeltaX),
+                                    deltaY: event.getDoubleValueField(.mouseEventDeltaY)) { return nil }
             return Unmanaged.passUnretained(event)
 
         case .scrollWheel:
@@ -133,16 +193,22 @@ final class EventTapEngine {
             if event.getIntegerValueField(.eventSourceUserData) == ScrollAnimator.syntheticTag {
                 return Unmanaged.passUnretained(event)
             }
-            // Only transform a real mouse wheel (line-based). Leave trackpad/continuous scrolling alone.
-            let isContinuous = event.getIntegerValueField(.scrollWheelEventIsContinuous) != 0
-            guard !isContinuous else { return Unmanaged.passUnretained(event) }
+            // Leave real trackpad gestures completely alone — they carry a scroll or momentum phase,
+            // which a mouse wheel never does (high-resolution mice are "continuous" but phase-less, so
+            // we must NOT gate on `isContinuous` here — that's what was skipping reverse on those mice).
+            let phase = event.getIntegerValueField(scrollPhaseField)
+            let momentumPhase = event.getIntegerValueField(scrollMomentumPhaseField)
+            guard phase == 0, momentumPhase == 0 else { return Unmanaged.passUnretained(event) }
 
+            let isContinuous = event.getIntegerValueField(.scrollWheelEventIsContinuous) != 0
             let dir = reverse ? -1.0 : 1.0
             let lineV = Double(event.getIntegerValueField(.scrollWheelEventDeltaAxis1)) * dir
             let lineH = Double(event.getIntegerValueField(.scrollWheelEventDeltaAxis2)) * dir
 
-            if smooth {
-                scrollAnimator.addTick(lineV: lineV, lineH: lineH)
+            // Smooth mode drives a momentum glide from notched (line-based) ticks. High-res continuous
+            // mice have no line deltas, so they fall through to the reverse-in-place path below.
+            if smooth, !isContinuous, lineV != 0 || lineH != 0 {
+                scrollAnimator.addTick(lineV: lineV, lineH: lineH, speed: speed)
                 return nil // swallow; the animator drives a smooth pixel scroll
             }
             if reverse {
@@ -160,6 +226,11 @@ final class EventTapEngine {
         }
     }
 }
+
+/// Undocumented CGEvent scroll fields that distinguish a real trackpad gesture (which sets a scroll
+/// or momentum phase) from a mouse wheel (which never does, even high-resolution "continuous" mice).
+private let scrollPhaseField = CGEventField(rawValue: 99)!          // kCGScrollWheelEventScrollPhase
+private let scrollMomentumPhaseField = CGEventField(rawValue: 123)! // kCGScrollWheelEventMomentumPhase
 
 /// Flip the sign of an integer scroll field in place (used for reverse scrolling).
 private func negate(_ event: CGEvent, _ field: CGEventField) {

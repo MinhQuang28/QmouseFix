@@ -41,9 +41,20 @@ struct SettingsView: View {
 
     private var scrollTab: some View {
         Form {
-            Toggle("Smooth scrolling", isOn: $store.config.smoothScroll)
+            Picker("Scroll style", selection: $store.config.scrollMode) {
+                ForEach(ScrollMode.allCases, id: \.self) { Text($0.label).tag($0) }
+            }
+            if store.config.scrollMode == .smooth {
+                VStack(alignment: .leading) {
+                    Text("Scroll speed: \(String(format: "%.1f×", store.config.scrollSpeed))")
+                    Slider(value: $store.config.scrollSpeed, in: 0.2...1.5, step: 0.1) {
+                        Text("Scroll speed")
+                    } minimumValueLabel: { Text("Slow").font(.caption) }
+                      maximumValueLabel: { Text("Fast").font(.caption) }
+                }
+            }
             Toggle("Reverse scroll direction", isOn: $store.config.reverseScroll)
-            Text("Applies to a physical mouse wheel only — trackpad scrolling is left untouched.")
+            Text("Standard = stepped wheel (Windows-like). Smooth = trackpad-style momentum. Applies to a physical mouse wheel only — trackpad scrolling is left untouched.")
                 .font(.caption).foregroundStyle(.secondary)
         }
         .formStyle(.grouped)
@@ -60,6 +71,7 @@ struct SettingsView: View {
                     Text("Drag distance per Space: \(Int(store.config.spaceDragThreshold)) px")
                     Slider(value: $store.config.spaceDragThreshold, in: 100...400, step: 10)
                 }
+                Toggle("Reverse drag direction", isOn: $store.config.spaceDragReverse)
             }
             Text("Hold the chosen button and drag left/right to switch Spaces — one jump per drag distance. (macOS 26+ only supports discrete jumps, not a smooth follow-finger animation.)")
                 .font(.caption).foregroundStyle(.secondary)

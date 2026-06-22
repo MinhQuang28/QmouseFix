@@ -41,7 +41,17 @@ cat > "$OUT/Contents/Info.plist" <<PLIST
 </plist>
 PLIST
 
-echo "==> ad-hoc signing"
-codesign --force --sign - --timestamp=none "$OUT" >/dev/null 2>&1
+# Sign with the stable local identity if present (run tools/setup-signing-cert.sh once).
+# A fixed cert keeps the designated requirement constant across rebuilds, so Accessibility
+# is granted ONCE and survives every rebuild. Fall back to ad-hoc if the cert isn't set up.
+SIGN_HASH="$(security find-identity "$HOME/Library/Keychains/login.keychain-db" \
+    | awk '/QmouseFix Local Signing/ {print $2; exit}')"
+if [ -n "$SIGN_HASH" ]; then
+    echo "==> signing with stable identity ($SIGN_HASH)"
+    codesign --force --sign "$SIGN_HASH" --timestamp=none "$OUT" >/dev/null 2>&1
+else
+    echo "==> ad-hoc signing (run tools/setup-signing-cert.sh for a stable signature)"
+    codesign --force --sign - --timestamp=none "$OUT" >/dev/null 2>&1
+fi
 
 echo "==> done: $(cd "$(dirname "$OUT")" && pwd)/${APP_NAME}.app"
