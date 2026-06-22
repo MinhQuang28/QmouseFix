@@ -48,6 +48,10 @@ final class EventTapEngine {
                              name: NSWorkspace.didWakeNotification, object: nil)
         wsCenter.addObserver(self, selector: #selector(handleWake),
                              name: NSWorkspace.screensDidWakeNotification, object: nil)
+        // Plugging/unplugging an external display or changing resolution invalidates the scroll
+        // animator's CADisplayLink the same way sleep does — rebuild it so scroll never silently dies.
+        NotificationCenter.default.addObserver(self, selector: #selector(handleWake),
+                             name: NSApplication.didChangeScreenParametersNotification, object: nil)
         startWatchdog()
     }
 
@@ -201,13 +205,23 @@ final class EventTapEngine {
             guard phase == 0, momentumPhase == 0 else { return Unmanaged.passUnretained(event) }
 
             let isContinuous = event.getIntegerValueField(.scrollWheelEventIsContinuous) != 0
+
+            // High-resolution / free-spin mice (e.g. MX Master 3) report continuous pixel deltas and,
+            // on free-spin, the hardware flywheel coasts on its own. The OS already renders these
+            // smoothly, so running them through our momentum engine would fight the flywheel and feel
+            // floaty. Instead keep them native but honor the user's Scroll-speed slider and reverse —
+            // both of which otherwise never reach a continuous mouse.
+            if isContinuous {
+                applyContinuous(event, speed: speed, reverse: reverse)
+                return Unmanaged.passUnretained(event)
+            }
+
             let dir = reverse ? -1.0 : 1.0
             let lineV = Double(event.getIntegerValueField(.scrollWheelEventDeltaAxis1)) * dir
             let lineH = Double(event.getIntegerValueField(.scrollWheelEventDeltaAxis2)) * dir
 
-            // Smooth mode drives a momentum glide from notched (line-based) ticks. High-res continuous
-            // mice have no line deltas, so they fall through to the reverse-in-place path below.
-            if smooth, !isContinuous, lineV != 0 || lineH != 0 {
+            // Notched mouse: smooth mode drives a momentum glide from the discrete line ticks.
+            if smooth, lineV != 0 || lineH != 0 {
                 scrollAnimator.addTick(lineV: lineV, lineH: lineH, speed: speed)
                 return nil // swallow; the animator drives a smooth pixel scroll
             }
@@ -231,6 +245,34 @@ final class EventTapEngine {
 /// or momentum phase) from a mouse wheel (which never does, even high-resolution "continuous" mice).
 private let scrollPhaseField = CGEventField(rawValue: 99)!          // kCGScrollWheelEventScrollPhase
 private let scrollMomentumPhaseField = CGEventField(rawValue: 123)! // kCGScrollWheelEventMomentumPhase
+
+extension EventTapEngine {
+    /// Scale a continuous (high-res) mouse's deltas by the Scroll-speed slider and flip them for
+    /// reverse, in place. Neutral speed (0.5, the slider default) maps to gain 1.0 so the mouse keeps
+    /// its native feel until the user actually moves the slider.
+    fileprivate func applyContinuous(_ event: CGEvent, speed: Double, reverse: Bool) {
+        let gain = (speed / 0.5) * (reverse ? -1.0 : 1.0)
+        if gain == 1.0 { return } // default speed, not reversed → leave the event untouched
+        scaleInt(event, .scrollWheelEventDeltaAxis1, gain)
+        scaleInt(event, .scrollWheelEventDeltaAxis2, gain)
+        scaleInt(event, .scrollWheelEventPointDeltaAxis1, gain)
+        scaleInt(event, .scrollWheelEventPointDeltaAxis2, gain)
+        // Fixed-point deltas are what AppKit actually reads for continuous scrolling.
+        scaleDouble(event, .scrollWheelEventFixedPtDeltaAxis1, gain)
+        scaleDouble(event, .scrollWheelEventFixedPtDeltaAxis2, gain)
+    }
+}
+
+/// Scale an integer scroll field in place (rounded). Used for continuous-mouse speed/reverse.
+private func scaleInt(_ event: CGEvent, _ field: CGEventField, _ factor: Double) {
+    let scaled = Double(event.getIntegerValueField(field)) * factor
+    event.setIntegerValueField(field, value: Int64(scaled.rounded()))
+}
+
+/// Scale a fixed-point (double) scroll field in place.
+private func scaleDouble(_ event: CGEvent, _ field: CGEventField, _ factor: Double) {
+    event.setDoubleValueField(field, value: event.getDoubleValueField(field) * factor)
+}
 
 /// Flip the sign of an integer scroll field in place (used for reverse scrolling).
 private func negate(_ event: CGEvent, _ field: CGEventField) {
