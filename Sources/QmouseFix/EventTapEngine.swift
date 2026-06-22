@@ -1,6 +1,7 @@
 import AppKit
 import CoreGraphics
 import Foundation
+import IOKit.hid
 
 /// Owns the CGEventTap that intercepts mouse buttons and scroll, running on a dedicated
 /// high-priority thread (never the main thread — a stalled main thread would time out the tap).
@@ -12,6 +13,7 @@ final class EventTapEngine {
     private var tap: CFMachPort?
     private var thread: Thread?
     private var watchdog: Timer?
+    private var hidManager: IOHIDManager?
 
     // Snapshot read by the tap callback thread; guarded by `lock`.
     private let lock = NSLock()
@@ -64,12 +66,47 @@ final class EventTapEngine {
         wsCenter.addObserver(self, selector: #selector(handleContextChange),
                              name: NSWorkspace.didActivateApplicationNotification, object: nil)
         startWatchdog()
+        startDeviceMonitor()
     }
 
     /// Space/app-focus changed — end any in-flight smooth gesture so it can't get orphaned across the
     /// boundary (harmless no-op when no gesture is active).
     @objc func handleContextChange() {
         scrollAnimator.endGestureNow()
+    }
+
+    /// A mouse (dis)connected — e.g. changing the report rate re-enumerates it on USB, which orphans
+    /// an in-flight smooth gesture just like a Space switch. Re-enable the tap and end the gesture so
+    /// the next scroll starts fresh.
+    private func handleDeviceChange() {
+        reEnableTap()
+        scrollAnimator.endGestureNow()
+    }
+
+    /// Watch for mice connecting/disconnecting via IOKit. Device matching/removal notifications need no
+    /// Input-Monitoring permission (we never read input values) — they just tell us when to recover.
+    private func startDeviceMonitor() {
+        let mgr = IOHIDManagerCreate(kCFAllocatorDefault, IOOptionBits(kIOHIDOptionsTypeNone))
+        let match: [String: Any] = [
+            kIOHIDDeviceUsagePageKey as String: kHIDPage_GenericDesktop,
+            kIOHIDDeviceUsageKey as String: kHIDUsage_GD_Mouse,
+        ]
+        IOHIDManagerSetDeviceMatching(mgr, match as CFDictionary)
+        let ctx = Unmanaged.passUnretained(self).toOpaque()
+        let cb: IOHIDDeviceCallback = { context, _, _, _ in
+            guard let context else { return }
+            Unmanaged<EventTapEngine>.fromOpaque(context).takeUnretainedValue().handleDeviceChange()
+        }
+        IOHIDManagerRegisterDeviceMatchingCallback(mgr, cb, ctx)
+        IOHIDManagerRegisterDeviceRemovalCallback(mgr, cb, ctx)
+        IOHIDManagerScheduleWithRunLoop(mgr, CFRunLoopGetMain(), CFRunLoopMode.commonModes.rawValue)
+        let opened = IOHIDManagerOpen(mgr, IOOptionBits(kIOHIDOptionsTypeNone))
+        if opened != kIOReturnSuccess {
+            // Non-fatal: device callbacks won't fire, so report-rate re-enumeration recovery is skipped
+            // (Space/app-switch recovery is unaffected). Log so a silent failure is diagnosable.
+            NSLog("QmouseFix: IOHIDManagerOpen failed (0x%X) — report-rate scroll recovery disabled", opened)
+        }
+        hidManager = mgr
     }
 
     /// On wake, re-enable the tap AND rebuild the scroll animator's display link, which macOS

@@ -126,6 +126,8 @@ final class ScrollAnimator: NSObject {
         lock.unlock()
 
         guard hadGesture, let rl else { return } // nothing open → nothing to close
+        // The block runs on the link thread (rl is the run loop `runLoop()` drives), the same thread
+        // as step()/post() — so touching `post()` and `displayLink` here is single-threaded and safe.
         CFRunLoopPerformBlock(rl, CFRunLoopMode.commonModes.rawValue) { [weak self] in
             guard let self else { return }
             self.post(intV: 0, intH: 0, preciseV: 0, preciseH: 0, phase: self.phaseEnded)
